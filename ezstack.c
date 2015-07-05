@@ -1,4 +1,4 @@
-/* Copyright (c) 2008-2014 Eugene Zharkov
+/* Copyright (c) 2008-2015 Eugene Zharkov
    All rights reserved.
 
    Redistribution and use in source and binary forms, with or without
@@ -28,9 +28,10 @@
   ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
   POSSIBILITY OF SUCH DAMAGE. */
 
-#define VERSION "31"
+#define VERSION "32"
 
 /* HISTORY
+150619 V32. Different prologue/epilogue on parts with 8-bit RAM address.
 141003 V31. FIX141003A: Yet another stack allocation pattern.
 140402 V30.
      - FIX140402C: The setup for epilogue call changed a bit.
@@ -667,6 +668,9 @@ static Bool cpu_isInstr_add(CpuAddr addr, unsigned rd, unsigned rr) {
 static Bool cpu_isInstr_cpc(CpuAddr addr, unsigned rd, unsigned rr) {
   return cpu_isInstr_rdrr(addr, "cpc", rd, rr);
 }
+static Bool cpu_isInstr_eor(CpuAddr addr, unsigned rd, unsigned rr) {
+  return cpu_isInstr_rdrr(addr, "eor", rd, rr);
+}
 static Bool cpu_isInstr_mov(CpuAddr addr, unsigned rd, unsigned rr) {
   return cpu_isInstr_rdrr(addr, "mov", rd, rr);
 }
@@ -835,6 +839,7 @@ static void sbc_0000_10rd_dddd_rrrr(void) {}
 static void add_0000_11rd_dddd_rrrr(void) {}
 static void cpc_0000_01rd_dddd_rrrr(void) {}
 static void cpi_0011_KKKK_dddd_KKKK(void) {}
+static void eor_0010_01rd_dddd_rrrr(void) {}
 static void lpm_1001_000d_dddd_0100(void) {}
 static void lpmP_1001_000d_dddd_0101(void) {}
 static void mov_0010_11rd_dddd_rrrr(void) {}
@@ -907,7 +912,7 @@ static void defineInstructions(void) {
   N1(1001_0101_1101_1000, elpm1,	          none);
   N1(1001_000d_dddd_0110, elpm2,	   d_dddd_0000);
   N1(1001_000d_dddd_0111, elpm3,	   d_dddd_0000);
-  N1(0010_01rd_dddd_rrrr, eor,		  rd_dddd_rrrr);
+  Y1(0010_01rd_dddd_rrrr, eor,		  rd_dddd_rrrr);
   N1(0000_0011_0ddd_1rrr, fmul,		      ddd_0rrr);
   N1(0000_0011_1ddd_0rrr, fmuls,	      ddd_0rrr);
   N1(0000_0011_1ddd_1rrr, fmulsu,	      ddd_0rrr);
@@ -1433,6 +1438,7 @@ typedef struct {
   unsigned numIsrs;
   unsigned numInterruptVectors;
   unsigned vectorSize;
+  Bool epilogueIsTiny;
 } Arch;
 
 static Uint8 setjmpPattern[] = {
@@ -1515,6 +1521,32 @@ static Uint8 tablejump2Pattern[] = {
   0x09, 0x94,
 };
 
+static Uint8 prologueTinyPattern[] = {
+  0x2f, 0x92, // push	r2
+  0x3f, 0x92, // push	r3
+  0x4f, 0x92, // push	r4
+  0x5f, 0x92, // push	r5
+  0x6f, 0x92, // push	r6
+  0x7f, 0x92, // push	r7
+  0x8f, 0x92, // push	r8
+  0x9f, 0x92, // push	r9
+  0xaf, 0x92, // push	r10
+  0xbf, 0x92, // push	r11
+  0xcf, 0x92, // push	r12
+  0xdf, 0x92, // push	r13
+  0xef, 0x92, // push	r14
+  0xff, 0x92, // push	r15
+  0x0f, 0x93, // push	r16
+  0x1f, 0x93, // push	r17
+  0xcf, 0x93, // push	r28
+  0xdf, 0x93, // push	r29
+  0xcd, 0xb7, // in	r28, 0x3d
+  0xca, 0x1b, // sub	r28, r26
+  0xcd, 0xbf, // out	0x3d, r28
+  0xdd, 0x27, // eor	r29, r29
+  0x09, 0x94, // ijmp
+};
+
 static Uint8 prologuePattern[] = {
   0x2f, 0x92, // push	r2
   0x3f, 0x92, // push	r3
@@ -1572,6 +1604,31 @@ static Uint8 prologueXmegaPattern[] = { // FIX140402A
   0xcd, 0xbf, // out	0x3d, r28
   0xde, 0xbf, // out	0x3e, r29
   0x09, 0x94, // ijmp
+};
+
+static Uint8 epilogueTinyPattern[] = {
+  0x2a, 0x88, // ldd	r2, Y+18
+  0x39, 0x88, // ldd	r3, Y+17
+  0x48, 0x88, // ldd	r4, Y+16
+  0x5f, 0x84, // ldd	r5, Y+15
+  0x6e, 0x84, // ldd	r6, Y+14
+  0x7d, 0x84, // ldd	r7, Y+13
+  0x8c, 0x84, // ldd	r8, Y+12
+  0x9b, 0x84, // ldd	r9, Y+11
+  0xaa, 0x84, // ldd	r10, Y+10
+  0xb9, 0x84, // ldd	r11, Y+9
+  0xc8, 0x84, // ldd	r12, Y+8
+  0xdf, 0x80, // ldd	r13, Y+7
+  0xee, 0x80, // ldd	r14, Y+6
+  0xfd, 0x80, // ldd	r15, Y+5
+  0x0c, 0x81, // ldd	r16, Y+4
+  0x1b, 0x81, // ldd	r17, Y+3
+  0xaa, 0x81, // ldd	r26, Y+2
+  0xd9, 0x81, // ldd	r29, Y+1
+  0xce, 0x0f, // add	r28, r30
+  0xcd, 0xbf, // out	0x3d, r28
+  0xca, 0x2f, // mov	r28, r26
+  0x08, 0x95, // ret
 };
 
 static Uint8 epiloguePattern[] = {
@@ -1676,11 +1733,14 @@ static void arch_registerTablejump2(Arch* h, ElfSymbol* s) {
 }
 static void arch_registerPrologue(Arch* h, ElfSymbol* s) {
   if (! M(h, prologue, prologue))
-    M(h, prologue, prologueXmega);
+    if (! M(h, prologue, prologueXmega))
+      M(h, prologue, prologueTiny);
 }
 static void arch_registerEpilogue(Arch* h, ElfSymbol* s) {
   if (! M(h, epilogue, epilogue))
-    M(h, epilogue, epilogueXmega);
+    if (! M(h, epilogue, epilogueXmega))
+      if (M(h, epilogue, epilogueTiny))
+	h->epilogueIsTiny = true;
 }
 #undef M
 
@@ -1933,12 +1993,22 @@ static unsigned arch_epilogue(Arch* h, unsigned retval) {
     unsigned high;
     unsigned low;
     if (! cpu_isInstr_sbci(iAddr - 2, 29, &high)) {
-      /*
-	-3: cd b7       	in	r28, 0x3d	; 61
-	-2: de b7       	in	r29, 0x3e	; 62
-      */
-      if (! cpu_isInstr_in(iAddr - 2, 29, CPU_stackPort + 1))
-	CPURRRA(iAddr- 2);
+      if (h->epilogueIsTiny) {
+	/*
+	  -3: cd b7       	in	r28, 0x3d
+	  -2: dd 27       	eor	r29, r29
+	*/
+	if (! cpu_isInstr_eor(iAddr - 2, 29, 29))
+	  CPURRRA(iAddr- 2);
+      }
+      else {
+	/*
+	  -3: cd b7       	in	r28, 0x3d
+	  -2: de b7       	in	r29, 0x3e
+	*/
+	if (! cpu_isInstr_in(iAddr - 2, 29, CPU_stackPort + 1))
+	  CPURRRA(iAddr- 2);
+      }
       if (! cpu_isInstr_in(iAddr - 3, 28, CPU_stackPort)) RRR();
       frame = 0;
     }
