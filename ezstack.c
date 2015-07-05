@@ -28,10 +28,10 @@
   ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
   POSSIBILITY OF SUCH DAMAGE. */
 
-#define VERSION "32"
+#define VERSION "33"
 
 /* HISTORY
-150619 V32. Different prologue/epilogue on parts with 8-bit RAM address.
+150705 V33. Another ijmp pattern.
 141003 V31. FIX141003A: Yet another stack allocation pattern.
 140402 V30.
      - FIX140402C: The setup for epilogue call changed a bit.
@@ -1807,8 +1807,11 @@ static void arch_ijmp(unsigned tableSize,
   cpu.pc = cpu.jumpTo2[0];
 }
 
-static Bool arch_parseJumpOverIjmp(CpuAddr addr, CpuAddr* endAddrPtr) {
+static Bool arch_parseJumpOverIjmp(CpuAddr addr, CpuAddr* endAddrPtr,
+				   Bool* movw3024) {
   Bool retval = true;
+  if (movw3024 != NULL)
+    *movw3024 = false;
   if (cpu_isInstr_rjmp(addr - 0, NULL)) {
     /*
       -1:	08 f0       	brcs	.+2
@@ -1826,13 +1829,21 @@ static Bool arch_parseJumpOverIjmp(CpuAddr addr, CpuAddr* endAddrPtr) {
     // -0:	98 f7       	brcc	.-26
     *endAddrPtr = addr - 1;
   }
+  else if (movw3024 != NULL && cpu_isInstr_movw(addr - 0, 30, 24)) {
+    if (! cpu_isInstr_rjmp(addr - 1, NULL)) CPURRRA(addr - 1);
+    if (cpu_isInstr_jmp(addr - 2, NULL)) RRR(); // LNK.prevInstr16Or32
+    if (! cpu_isInstr_brcs(addr - 2, NULL)) CPURRRA(addr - 2);
+    *endAddrPtr = addr - 3;
+    *movw3024 = true;
+  }
   else {
     retval = false;
   }
   return retval;
 }
 
-static void arch_parseIjmpTableSize(CpuAddr addr, unsigned* tableSizePtr) {
+static void arch_parseIjmpTableSize(CpuAddr addr, unsigned* tableSizePtr,
+				    Bool movw3024) {
   if (cpu_isInstr_cpc(addr - 0, 31, 1)) {
     /*
       -1:	e4 31       	cpi	r30, 0x14
@@ -1847,7 +1858,8 @@ static void arch_parseIjmpTableSize(CpuAddr addr, unsigned* tableSizePtr) {
       -0:	91 05       	cpc	r25, r1
     */
     if (! cpu_isInstr_cpi(addr - 1, 24, tableSizePtr)) RRR();
-    if (! cpu_isInstr_movw(addr - 2, 30, 24)) RRR();
+    if (! movw3024)
+      if (! cpu_isInstr_movw(addr - 2, 30, 24)) RRR();
   }
   else {
     RRR();
@@ -1867,12 +1879,12 @@ static void arch_parseTablejump2(CpuAddr addr,
       -1:	ff 4f       	sbci	r31, 0xFF
     */
     if (! cpu_isInstr_subi(addr - 2, 30, offsetLowPtr)) RRR();
-    if (arch_parseJumpOverIjmp(addr - 3, &tableSizeAddr))
-      arch_parseIjmpTableSize(tableSizeAddr, tableSizePtr);
+    if (arch_parseJumpOverIjmp(addr - 3, &tableSizeAddr, NULL))
+      arch_parseIjmpTableSize(tableSizeAddr, tableSizePtr, false);
     else {
       unsigned reg;
       if (! cpu_isInstr_movw_rrx(addr - 3, 30, &reg)) CPURRRA(addr - 3);
-      if (! arch_parseJumpOverIjmp(addr - 4, &tableSizeAddr))
+      if (! arch_parseJumpOverIjmp(addr - 4, &tableSizeAddr, NULL))
 	CPURRRA(addr - 4);
       if (! cpu_isInstr_cpc(tableSizeAddr - 0, reg + 1, 1)) RRR();
       if (! cpu_isInstr_cpi(tableSizeAddr - 1, reg, tableSizePtr)) RRR();
@@ -1898,7 +1910,8 @@ static void arch_parseTablejump2(CpuAddr addr,
     if (! cpu_isInstr_movw_rrx(addr - 1, 30, &reg)) CPURRRA(addr - 1);
     if (! cpu_isInstr_sbci(addr - 2, reg + 1, offsetHighPtr)) RRR();
     if (! cpu_isInstr_subi(addr - 3, reg, offsetLowPtr)) RRR();
-    if (! arch_parseJumpOverIjmp(addr - 4, &tableSizeAddr)) CPURRRA(addr - 4);
+    if (! arch_parseJumpOverIjmp(addr - 4, &tableSizeAddr, NULL))
+      CPURRRA(addr - 4);
     if (! cpu_isInstr_cpc(tableSizeAddr - 0, reg + 1, 1)) RRR();
     if (! cpu_isInstr_cpi(tableSizeAddr - 1, reg, tableSizePtr)) RRR();
   }
@@ -2204,6 +2217,7 @@ static void arch_cpuIjmp(void) {
   }
   else {
     CpuAddr tableSizeAddr;
+    Bool movw3024;
     /*
       -2:	e6 5e       	subi	r30, 0xE6	; 230
       -1:	ff 4f       	sbci	r31, 0xFF	; 255
@@ -2227,9 +2241,9 @@ static void arch_cpuIjmp(void) {
 	CPURRRA(addr - 1);
     }
     if (! cpu_isInstr_subi(addr - off - 2, 30, &offsetLow)) RRR();
-    if (! arch_parseJumpOverIjmp(addr - off - 3, &tableSizeAddr))
+    if (! arch_parseJumpOverIjmp(addr - off - 3, &tableSizeAddr, &movw3024))
       CPURRRA(addr - off - 3);
-    arch_parseIjmpTableSize(tableSizeAddr, &tableSize);
+    arch_parseIjmpTableSize(tableSizeAddr, &tableSize, movw3024);
     rjmp = true;
   }
 
@@ -2266,7 +2280,8 @@ static void arch_cpuRet(void) {
 
     if (! cpu_isInstr_sbci(addr - 3, regHigh, &offsetHigh)) CPURRRA(addr - 3);
     if (! cpu_isInstr_subi(addr - 4, regLow, &offsetLow)) CPURRRA(addr - 4);
-    if (! arch_parseJumpOverIjmp(addr - 5, &tableSizeAddr)) CPURRRA(addr - 5);
+    if (! arch_parseJumpOverIjmp(addr - 5, &tableSizeAddr, NULL))
+      CPURRRA(addr - 5);
     if (! cpu_isInstr_cpc(tableSizeAddr - 0, regHigh, 1)) RRR();
     if (! cpu_isInstr_cpi(tableSizeAddr - 1, regLow, &tableSize)) RRR();
 
