@@ -1,4 +1,4 @@
-/* Copyright (c) 2008-2015 Eugene Zharkov
+/* Copyright (c) 2008-2016 Eugene Zharkov
    All rights reserved.
 
    Redistribution and use in source and binary forms, with or without
@@ -28,9 +28,13 @@
   ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
   POSSIBILITY OF SUCH DAMAGE. */
 
-#define VERSION "33"
+#define VERSION "35"
 
 /* HISTORY
+160629 V35. FIX160629A: Increased an internal table size.
+150925 V34.
+     - FIX150925B: New pattern for large stack frame in main.
+     - FIX150925A: New ijmp pattern.
 150705 V33. Another ijmp pattern.
 141003 V31. FIX141003A: Yet another stack allocation pattern.
 140402 V30.
@@ -273,7 +277,7 @@ struct {
   Bool wrap0;
 
   CpuICallList* icall;
-  CpuAddr parseHistory[5];
+  CpuAddr parseHistory[6];
 
   struct {
     unsigned tableSize;
@@ -703,16 +707,20 @@ static Bool cpu_isInstr_push(CpuAddr addr, unsigned* reg) {
   return true;
 }
 
-static Bool cpu_isInstrDoesNotTouchZ(CpuAddr addr) {
+static Bool cpu_isInstrDoesNotTouchPair(CpuAddr addr, unsigned regLow) {
   if (cpu_isInstr(addr, "mov")) {
-    if (cpu.rd < 30)
+    if (cpu.rd != regLow && cpu.rd != regLow + 1)
       return true;
   }
   else if (cpu_isInstr(addr, "subi")) {
-    if (cpu.rd < 30)
+    if (cpu.rd != regLow && cpu.rd != regLow + 1)
       return true;
   }
   return false; // We just don't know.
+}
+
+static Bool cpu_isInstrDoesNotTouchZ(CpuAddr addr) {
+  return cpu_isInstrDoesNotTouchPair(addr, 30);
 }
 
 static void adiw_1001_0110_KKdd_KKKK(void) {}
@@ -1695,6 +1703,27 @@ enum {
   ArchPatternType_tablejump2,
 };
 
+static Bool arch_isStackInIn(CpuAddr addr, unsigned reg) {
+  // -3: cd b7       	in	r28, 0x3d
+  // -2: de b7       	in	r29, 0x3e
+  if (! cpu_isInstr_in(addr + 1, reg + 1, CPU_stackPort + 1)) return false;
+  if (! cpu_isInstr_in(addr + 0, reg + 0, CPU_stackPort)) return false;
+  return true;
+}
+
+static Bool arch_isSubiSbci(CpuAddr addr, unsigned reg, unsigned* value) {
+  // -1: ea 5b       	subi	r30, 0xBA
+  // -0: ff 4f       	sbci	r31, 0xFF
+  unsigned low;
+  unsigned high;
+  if (! cpu_isInstr_sbci(addr + 1, reg + 1, &high))
+    return false;
+  if (! cpu_isInstr_subi(addr + 0, reg + 0, &low))
+    return false;
+  *value = (high << 8) | low;
+  return true;
+}
+
 static Bool arch_isPatternMatch(ElfSymbol* s, Uint8* data, unsigned size) {
   if (s->addr + size < cpu.bProgSize)
     if (memcmp(cpu.prog + s->addr, data, size) == 0)
@@ -1758,10 +1787,10 @@ static Bool arch_isPcInsidePattern(ArchPattern* p, unsigned pc) {
   return p->addr <= addr && addr < p->addr + p->size;
 }
 
-static Bool arch_isPrologueJumpx(Arch* h) {
+static Bool arch_isPrologueJump(Arch* h) {
   return arch_isPcInsidePattern(&h->prologue, cpu.pc);
 }
-static Bool arch_isEpilogueJumpx(Arch* h) {
+static Bool arch_isEpilogueJump(Arch* h) {
   return arch_isPcInsidePattern(&h->epilogue, cpu.pc);
 }
 
@@ -1770,12 +1799,9 @@ static Bool arch_isTablejump2(Arch* h) {
   return h->tablejump2.defined && addr == h->tablejump2.addr;
 }
 
-static void arch_ijmp(unsigned tableSize,
-		      unsigned offsetLow,
-		      unsigned offsetHigh,
-		      Bool rjmp) {
+static void arch_ijmp(unsigned tableSize, unsigned offsetArg, Bool rjmp) {
 
-  unsigned offset = 0x10000 - ((offsetHigh << 8) | offsetLow);
+  unsigned offset = 0x10000 - offsetArg;
   unsigned numEntries = tableSize;
   unsigned i;
 
@@ -1868,17 +1894,11 @@ static void arch_parseIjmpTableSize(CpuAddr addr, unsigned* tableSizePtr,
 
 static void arch_parseTablejump2(CpuAddr addr,
 				 unsigned* tableSizePtr,
-				 unsigned* offsetLowPtr,
-				 unsigned* offsetHighPtr) {
+				 unsigned* offsetPtr) {
     
   CpuAddr tableSizeAddr;
 
-  if (cpu_isInstr_sbci(addr - 1, 31, offsetHighPtr)) {
-    /*
-      -2:	ea 5b       	subi	r30, 0xBA
-      -1:	ff 4f       	sbci	r31, 0xFF
-    */
-    if (! cpu_isInstr_subi(addr - 2, 30, offsetLowPtr)) RRR();
+  if (arch_isSubiSbci(addr - 2, 30, offsetPtr)) {
     if (arch_parseJumpOverIjmp(addr - 3, &tableSizeAddr, NULL))
       arch_parseIjmpTableSize(tableSizeAddr, tableSizePtr, false);
     else {
@@ -1908,8 +1928,7 @@ static void arch_parseTablejump2(CpuAddr addr,
       -1:	fc 01       	movw	r30, r24
     */
     if (! cpu_isInstr_movw_rrx(addr - 1, 30, &reg)) CPURRRA(addr - 1);
-    if (! cpu_isInstr_sbci(addr - 2, reg + 1, offsetHighPtr)) RRR();
-    if (! cpu_isInstr_subi(addr - 3, reg, offsetLowPtr)) RRR();
+    if (! arch_isSubiSbci(addr - 3, reg, offsetPtr)) CPURRRA(addr - 3);
     if (! arch_parseJumpOverIjmp(addr - 4, &tableSizeAddr, NULL))
       CPURRRA(addr - 4);
     if (! cpu_isInstr_cpc(tableSizeAddr - 0, reg + 1, 1)) RRR();
@@ -1918,14 +1937,13 @@ static void arch_parseTablejump2(CpuAddr addr,
 }
 
 static unsigned arch_tablejump2(Arch* h, unsigned retval) {
-  unsigned offsetHigh;
-  unsigned offsetLow;
+  unsigned offset;
   unsigned tableSize = 0;
   unsigned pc = cpu.pc;
   arch_markReached(h, &h->tablejump2);
-  arch_parseTablejump2(cpu.pcPrev, &tableSize, &offsetLow, &offsetHigh);
+  arch_parseTablejump2(cpu.pcPrev, &tableSize, &offset);
   cpu.pc = pc;
-  arch_ijmp(tableSize, offsetLow, offsetHigh, false);
+  arch_ijmp(tableSize, offset, false);
   return retval;
 }
 
@@ -2003,9 +2021,10 @@ static unsigned arch_epilogue(Arch* h, unsigned retval) {
       -3:	c2 5a       	subi	r28, 0xA2	; 162
       -2:	df 4f       	sbci	r29, 0xFF	; 255
     */
-    unsigned high;
-    unsigned low;
-    if (! cpu_isInstr_sbci(iAddr - 2, 29, &high)) {
+    unsigned val16;
+    if (arch_isSubiSbci(iAddr - 3, 28, &val16))
+      frame = 0x10000 - val16;
+    else {
       if (h->epilogueIsTiny) {
 	/*
 	  -3: cd b7       	in	r28, 0x3d
@@ -2024,10 +2043,6 @@ static unsigned arch_epilogue(Arch* h, unsigned retval) {
       }
       if (! cpu_isInstr_in(iAddr - 3, 28, CPU_stackPort)) RRR();
       frame = 0;
-    }
-    else {
-      if (! cpu_isInstr_subi(iAddr - 3, 28, &low)) CPURRR();
-      frame = 0x10000 - ((high << 8) | low);
     }
   }
 
@@ -2185,8 +2200,7 @@ ArchPattern* archGetReachedPattern(Arch* h, unsigned i) {
 static void arch_cpuIjmp(void) {
 
   CpuAddr addr = cpu.pcPrev;
-  unsigned offsetHigh;
-  unsigned offsetLow;
+  unsigned offset;
   unsigned tableSize = 0;
   Bool rjmp = false;
 
@@ -2213,7 +2227,7 @@ static void arch_cpuIjmp(void) {
     if (! cpu_isInstr_lpmP(addr - 3, 0)) RRR();
     if (! cpu_isInstr_adc(addr - 4, 31, 31)) RRR();
     if (! cpu_isInstr_add(addr - 5, 30, 30)) RRR();
-    arch_parseTablejump2(addr - 5, &tableSize, &offsetLow, &offsetHigh);
+    arch_parseTablejump2(addr - 5, &tableSize, &offset);
   }
   else {
     CpuAddr tableSizeAddr;
@@ -2224,9 +2238,9 @@ static void arch_cpuIjmp(void) {
       -0:	09 94       	ijmp
     */
     unsigned off = 0;
+    unsigned offsetHigh;
+    unsigned offsetLow;
     if (! cpu_isInstr_sbci(addr - off - 1 , 31, &offsetHigh)) {
-      /* FIX110810A: switch in ecp3Handler in wdui has a couple of
-	 instructions between sbci and ijmp. */
       if (ps0 != addr) RRR();
       if (ps1 != addr - 1) RRR();
       if (ps2 != addr - 2) RRR();
@@ -2245,10 +2259,11 @@ static void arch_cpuIjmp(void) {
       CPURRRA(addr - off - 3);
     arch_parseIjmpTableSize(tableSizeAddr, &tableSize, movw3024);
     rjmp = true;
+    offset = (offsetHigh << 8) | offsetLow;
   }
 
   if (! cpu_isInstr(addr - 0, "ijmp")) RRR(); // This restores cpu.pc!
-  arch_ijmp(tableSize, offsetLow, offsetHigh, rjmp);
+  arch_ijmp(tableSize, offset, rjmp);
 }
 
 static void arch_cpuRet(void) {
@@ -2266,7 +2281,20 @@ static void arch_cpuRet(void) {
      -2:	8f 93       	push	r24
      -1:	9f 93       	push	r25
      -0:	08 95       	ret
+
+     FIX150925A: Extra stuff between subi/sbci & push:
+     -6:	86 5e       	subi	r24, 0xE6
+     -5:	9f 4f       	sbci	r25, 0xFF
+     -4:	42 2f       	mov	r20, r18
+     -3:	41 56       	subi	r20, 0x61
+     -2:	8f 93       	push	r24
+     -1:	9f 93       	push	r25
+     -0:	08 95       	ret
   */
+
+  CpuAddr ps3 = cpu.parseHistory[3];
+  CpuAddr ps4 = cpu.parseHistory[4];
+  CpuAddr ps5 = cpu.parseHistory[5];
 
   if (cpu.parseHistory[1] == addr - 1 && // 16-bit instruction?
       cpu.parseHistory[2] == addr - 2 && // 16-bit instruction?
@@ -2274,14 +2302,21 @@ static void arch_cpuRet(void) {
       cpu_isInstr_push(addr - 2, &regLow)) {
 
     CpuAddr tableSizeAddr;
+    unsigned brAddr = addr - 5;
     unsigned tableSize;
-    unsigned offsetLow;
-    unsigned offsetHigh;
+    unsigned offset;
 
-    if (! cpu_isInstr_sbci(addr - 3, regHigh, &offsetHigh)) CPURRRA(addr - 3);
-    if (! cpu_isInstr_subi(addr - 4, regLow, &offsetLow)) CPURRRA(addr - 4);
-    if (! arch_parseJumpOverIjmp(addr - 5, &tableSizeAddr, NULL))
-      CPURRRA(addr - 5);
+    if (! arch_isSubiSbci(addr - 4, regLow, &offset)) {
+      if (ps3 != addr - 3) CPURRRA(addr);
+      if (ps4 != addr - 4) CPURRRA(addr);
+      if (ps5 != addr - 5) CPURRRA(addr);
+      if (! cpu_isInstrDoesNotTouchPair(addr - 3, regLow)) CPURRRA(addr - 3);
+      if (! cpu_isInstrDoesNotTouchPair(addr - 4, regLow)) CPURRRA(addr - 4);
+      if (! arch_isSubiSbci(addr - 6, regLow, &offset)) CPURRRA(addr - 6);
+      brAddr -= 2;
+    }
+    if (! arch_parseJumpOverIjmp(brAddr, &tableSizeAddr, NULL))
+      CPURRRA(brAddr);
     if (! cpu_isInstr_cpc(tableSizeAddr - 0, regHigh, 1)) RRR();
     if (! cpu_isInstr_cpi(tableSizeAddr - 1, regLow, &tableSize)) RRR();
 
@@ -2291,7 +2326,7 @@ static void arch_cpuRet(void) {
     }
     cpuStack(-2);
     cpu.flags &= ~CPU_F_ret; // LNK.undoCpuRet
-    arch_ijmp(tableSize, offsetLow, offsetHigh, true);
+    arch_ijmp(tableSize, offset, true);
     return;
   }
 
@@ -2346,19 +2381,15 @@ static Bool arch_ascccs_oneFollowedByAnother(CpuAddr addr) {
 static Bool arch_isXmegaSubiSbciStackSequence(CpuAddr addr, int* changePtr) {
   unsigned reg;
   unsigned u16;
-  unsigned bigK;
   int change;
   if (! cpu_isInstr_outX(addr - 0, &reg, CPU_stackPort + 1)) return false;
   if (! cpu_isInstr_outN(addr - 1, reg - 1, CPU_stackPort)) return false;
-  if (! cpu_isInstr_sbci(addr - 2, reg, &u16)) return false;
-  if (! cpu_isInstr_subi(addr - 3, reg - 1, &bigK)) return false;
-  u16 = (u16 << 8) + bigK;
+  if (! arch_isSubiSbci(addr - 3, reg - 1, &u16)) return false;
   if (u16 & 0x8000)
     change = - (int) (0x10000 - u16);
   else {
     change = u16;
-    if (! cpu_isInstr_in(addr - 4, reg, CPU_stackPort + 1)) return false;
-    if (! cpu_isInstr_in(addr - 5, reg - 1, CPU_stackPort)) return false;
+    if (! arch_isStackInIn(addr - 5, reg - 1)) return false;
   }
   *changePtr = change;
   return true;
@@ -2379,8 +2410,7 @@ static Bool arch_isXmegaAdiwStackSequence(CpuAddr addr, int* changePtr) {
   if (! cpu_isInstr_outN(addr - 1, reg - 1, CPU_stackPort)) return false;
   if (! cpu_isInstr_adiw(addr - 2, reg - 1, &bigK)) return false;
   change = - (int) bigK;
-  if (! cpu_isInstr_in(addr - 3, reg, CPU_stackPort + 1)) return false;
-  if (! cpu_isInstr_in(addr - 4, reg - 1, CPU_stackPort)) return false;
+  if (! arch_isStackInIn(addr - 4, reg - 1)) return false;
   *changePtr = change;
   return true;
 }
@@ -2394,15 +2424,13 @@ static Bool arch_isXmegaSbiwStackSequence(CpuAddr addr, int* changePtr) {
   if (! cpu_isInstr_outN(addr - 1, reg - 1, CPU_stackPort)) return false;
   if (! cpu_isInstr_sbiw(addr - 2, reg - 1, &bigK)) return false;
   change = (int) bigK;
-  if (! cpu_isInstr_in(addr - 3, reg, CPU_stackPort + 1)) return false;
-  if (! cpu_isInstr_in(addr - 4, reg - 1, CPU_stackPort)) return false;
+  if (! arch_isStackInIn(addr - 4, reg - 1)) return false;
   *changePtr = change;
   return true;
 }
 
 static int arch_analyzeStackChangeCodeSection(CpuAddr addr) {
 
-  unsigned bigK;
   unsigned reg;
   int change;
 
@@ -2435,6 +2463,7 @@ static int arch_analyzeStackChangeCodeSection(CpuAddr addr) {
         0:	cd bf       	out	0x3d, r28	; 61
     */
     if (! cpu_isInstr_outN(addr - 1, 29, CPU_stackPort + 1)) {
+      unsigned bigK;
       // FIX120325A: xmega
       /*
 	-1:	cd bf       	out	0x3d, r28	; 61
@@ -2458,19 +2487,25 @@ static int arch_analyzeStackChangeCodeSection(CpuAddr addr) {
 	}
       else {
 	change = bigK;
-	if (! cpu_isInstr_in(addr - 3, 29, CPU_stackPort + 1)) RRR();
-	if (! cpu_isInstr_in(addr - 4, 28, CPU_stackPort)) RRR();
+	if (! arch_isStackInIn(addr - 4, 28)) CPURRRA(addr - 4);
       }
     }
     else {
+      unsigned size;
+      unsigned inInAddr = addr - 4;
       if (! cpu_isInstr_outN(addr + 0, 28, CPU_stackPort)) RRR();
-      if (! cpu_isInstr_sbiw(addr - 2, 28, &bigK)) RRR();
-      change = bigK;
-      if (! cpu_isInstr_in(addr - 3, 29, CPU_stackPort + 1)) RRR();
-      if (! cpu_isInstr_in(addr - 4, 28, CPU_stackPort)) RRR();
+      if (! cpu_isInstr_sbiw(addr - 2, 28, &size)) {
+	/* FIX150925B: Large stack frame in main */ {
+	  if (! arch_isSubiSbci(addr - 3, 28, &size)) CPURRRA(addr - 3);
+	  inInAddr--;
+	}
+      }
+      change = size;
+      if (! arch_isStackInIn(inInAddr, 28)) CPURRRA(inInAddr);
     }
   }
   else {
+    unsigned bigK;
     /* Allocate or free small frame (note that r24,r25 and r30,r31 can
        also be used instead of r28,r29):
        -4:	0f b6       	in	r0, 0x3f	; 63
@@ -2498,8 +2533,7 @@ static int arch_analyzeStackChangeCodeSection(CpuAddr addr) {
 	 -5:	64 97       	sbiw	r28, 0x14	; 20
       */
       change = bigK;
-      if (! cpu_isInstr_in(addr - 6, reg, CPU_stackPort + 1)) RRR();
-      if (! cpu_isInstr_in(addr - 7, reg - 1, CPU_stackPort)) RRR();
+      if (! arch_isStackInIn(addr - 7, reg - 1)) CPURRRA(addr - 7);
     }
     else {
       unsigned u16;
@@ -2512,14 +2546,11 @@ static int arch_analyzeStackChangeCodeSection(CpuAddr addr) {
 	 de 4f       	sbci	r29, 0xFE	; 254
       */
       //printf("addr=%x\n", addr * 2);
-      if (! cpu_isInstr_sbci(addr - 5, reg, &u16)) CPURRRA(addr - 5);
-      if (! cpu_isInstr_subi(addr - 6, reg - 1, &bigK)) RRR();
-      u16 = (u16 << 8) + bigK;
+      if (! arch_isSubiSbci(addr - 6, reg - 1, &u16)) CPURRRA(addr - 6);
       if (u16 & 0x8000)
 	change = - (int) (0x10000 - u16);
       else {
-	if (! cpu_isInstr_in(addr - 7, reg, CPU_stackPort + 1)) RRR();
-	if (! cpu_isInstr_in(addr - 8, reg - 1, CPU_stackPort)) RRR();
+	if (! arch_isStackInIn(addr - 8, reg - 1)) CPURRRA(addr - 8);
 	change = u16;
       }
     }
@@ -2582,9 +2613,9 @@ unsigned archParse(Arch* h, unsigned addr) {
       return arch_tablejump2(h, retval);
     if (h->prologue.defined && h->epilogue.defined) {
       //printf("pc = %x\n", cpu.pc * 2);
-      if (arch_isPrologueJumpx(h))
+      if (arch_isPrologueJump(h))
 	return arch_prologue(h, retval);
-      else if (arch_isEpilogueJumpx(h))
+      else if (arch_isEpilogueJump(h))
 	return arch_epilogue(h, retval);
     }
   }
@@ -2672,7 +2703,7 @@ typedef struct {
 typedef struct {
   MazeAddr nextAddr;
   MazeAddr prevAddr;
-  MazeAddr stack[200];
+  MazeAddr stack[500]; // FIX160629A: Was 200.
 
   MazeBlock** block;
   MazeBlock* blockArray;
